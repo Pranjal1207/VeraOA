@@ -1,0 +1,271 @@
+# bscc_upload_process_download_colab.py — Run this single cell in Google Colab
+
+import os
+import re
+import pathlib
+from typing import Optional, Tuple, List, Set
+
+import numpy as np
+import pandas as pd
+
+# --- Colab I/O ---
+try:
+    from google.colab import files  # type: ignore
+    _IN_COLAB = True
+except Exception:
+    files = None
+    _IN_COLAB = False
+
+OUTPUT_DIR = "/content/processed" if _IN_COLAB else os.path.abspath("./processed")
+
+# ----------------- Helpers -----------------
+def to_snake(s: str) -> str:
+    s = re.sub(r"[^\w\s]", " ", s)
+    s = re.sub(r"\s+", "_", s.strip())
+    return s.lower()
+
+def standardize_colnames(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [to_snake(c) for c in df.columns]
+    return df
+
+def _score_header(col: str, tokens: List[str]) -> int:
+    col_l = col.lower()
+    return sum(1 for t in tokens if t in col_l)
+
+def find_column(df: pd.DataFrame, candidates: List[List[str]]) -> Optional[str]:
+    best = (None, -1)
+    for col in df.columns:
+        for token_list in candidates:
+            score = _score_header(col, token_list)
+            if score > best[1]:
+                best = (col, score)
+    return best[0] if best[1] > 0 else None
+
+def _parse_month_val(val) -> Optional[int]:
+    if pd.isna(val):
+        return None
+    if isinstance(val, (int, np.integer, float, np.floating)):
+        v = int(val)
+        return v if 1 <= v <= 12 else None
+    s = str(val).strip().lower()
+    months = {
+        "jan":1,"january":1,"feb":2,"february":2,"mar":3,"march":3,"apr":4,"april":4,
+        "may":5,"jun":6,"june":6,"jul":7,"july":7,"aug":8,"august":8,"sep":9,"sept":9,"september":9,
+        "oct":10,"october":10,"nov":11,"november":11,"dec":12,"december":12
+    }
+    if s in months: return months[s]
+    m = re.search(r"\b(1[0-2]|0?[1-9])\b", s)
+    return int(m.group(1)) if m else None
+
+def _parse_year_val(val) -> Optional[int]:
+    if pd.isna(val):
+        return None
+    if isinstance(val, (int, np.integer, float, np.floating)):
+        v = int(val)
+        return v if 1900 <= v <= 3000 else None
+    s = re.sub(r"[^\d]", "", str(val))
+    if len(s) == 4:
+        v = int(s)
+        return v if 1900 <= v <= 3000 else None
+    return None
+
+def _last_day_of_month(year: int, month: int) -> pd.Timestamp:
+    first = pd.Timestamp(year=year, month=month, day=1)
+    next_month = (first + pd.offsets.MonthBegin(1))
+    return next_month - pd.Timedelta(days=1)
+
+def derive_report_date(df: pd.DataFrame, month_col: str, year_col: str) -> pd.Series:
+    months = df[month_col] if month_col in df.columns else pd.Series([None]*len(df))
+    years = df[year_col] if year_col in df.columns else pd.Series([None]*len(df))
+    m_parsed = months.apply(_parse_month_val)
+    y_parsed = years.apply(_parse_year_val)
+    if m_parsed.isna().all() or y_parsed.isna().all():
+        raise ValueError("Could not parse reporting month/year values.")
+    out = []
+    for m, y in zip(m_parsed, y_parsed):
+        out.append(_last_day_of_month(y, m) if (m is not None and y is not None) else pd.NaT)
+    return pd.to_datetime(pd.Series(out), errors="coerce")
+
+# --- Jurisdiction cleaning (CA counties aware) ---
+_CA_COUNTIES: Set[str] = {
+    "Alameda","Alpine","Amador","Butte","Calaveras","Colusa","Contra Costa","Del Norte","El Dorado",
+    "Fresno","Glenn","Humboldt","Imperial","Inyo","Kern","Kings","Lake","Lassen","Los Angeles",
+    "Madera","Marin","Mariposa","Mendocino","Merced","Modoc","Mono","Monterey","Napa","Nevada",
+    "Orange","Placer","Plumas","Riverside","Sacramento","San Benito","San Bernardino","San Diego",
+    "San Francisco","San Joaquin","San Luis Obispo","San Mateo","Santa Barbara","Santa Clara",
+    "Santa Cruz","Shasta","Sierra","Siskiyou","Solano","Sonoma","Stanislaus","Sutter","Tehama",
+    "Trinity","Tulare","Tuolumne","Ventura","Yolo","Yuba"
+}
+
+_JURIS_COUNTY_RE = re.compile(r"(?i)\b([A-Za-z][A-Za-z\-\s]+?)\s+county\b")
+_SHERIFF_SPLIT_RE = re.compile(r"(?i)\b(sheriff|sheriff's|dept|department|probation|police|office)\b")
+
+def _match_known_county(raw: str) -> Optional[str]:
+    s = raw.strip().lower()
+    for c in sorted(_CA_COUNTIES, key=len, reverse=True):
+        if c.lower() in s:
+            return f"{c} County"
+    return None
+
+def clean_jurisdiction_name(col: pd.Series) -> pd.Series:
+    def _one(x):
+        if pd.isna(x): return np.nan
+        raw = str(x)
+        # 1) If text already contains "... County", keep that county.
+        m = _JURIS_COUNTY_RE.search(raw)
+        if m:
+            name = re.sub(r"\s+", " ", m.group(1)).strip()
+            # Normalize capitalization for known counties if possible.
+            known = _match_known_county(name + " county")
+            return known if known else f"{name.title()} County"
+        # 2) Try to find a known county anywhere in the string.
+        known = _match_known_county(raw)
+        if known:
+            return known
+        # 3) Fallback: take leading segment before agency terms and append "County".
+        head = _SHERIFF_SPLIT_RE.split(raw)[0]
+        head = re.split(r"[-–,(\[]", head)[0]
+        head = re.sub(r"\s+", " ", head).strip()
+        if head:
+            return f"{head.title()} County"
+        return np.nan
+    return col.apply(_one)
+
+# --- Column typing helpers ---
+def likely_numeric(colname: str) -> bool:
+    c = colname.lower()
+    keywords = [
+        "count","total","avg","average","rate","percent","number","bed","capacity",
+        "population","booking","bookings","release","releases","adp","adl","ytd","sum"
+    ]
+    return any(k in c for k in keywords)
+
+def value_numeric_ratio(s: pd.Series) -> float:
+    try:
+        coerced = pd.to_numeric(s.replace({",": ""}, regex=True), errors="coerce")
+        return float(coerced.notna().mean())
+    except Exception:
+        return 0.0
+
+def coerce_numeric_columns(df: pd.DataFrame, protected: Set[str]) -> pd.DataFrame:
+    df = df.copy()
+    for col in df.columns:
+        if col in protected:
+            continue
+        if df[col].dtype.kind in "biufc":
+            coerced = pd.to_numeric(df[col], errors="coerce")
+        else:
+            # Heuristic: name-based OR majority of values numeric-like
+            ratio = value_numeric_ratio(df[col]) if df[col].dtype == "object" else 0.0
+            if likely_numeric(col) or ratio >= 0.6:
+                coerced = pd.to_numeric(df[col].replace({",": ""}, regex=True), errors="coerce")
+            else:
+                continue
+        # Cast
+        if coerced.notna().any():
+            if np.all(np.isnan(coerced) | np.isclose(coerced, np.floor(coerced))):
+                df[col] = coerced.astype("Int64")
+            else:
+                df[col] = coerced.astype(float)
+        else:
+            df[col] = coerced  # all-NaN float
+    return df
+
+def coerce_date_columns(df: pd.DataFrame, protected: Set[str]) -> pd.DataFrame:
+    df = df.copy()
+    # Any column with 'date' in its name should be date; keep report_date protected.
+    date_like = [c for c in df.columns if ("date" in c and c not in protected)]
+    for col in date_like:
+        s = pd.to_datetime(df[col], errors="coerce")
+        # Only keep as date if at least some values are valid dates; otherwise leave it alone.
+        if s.notna().any():
+            df[col] = s.dt.date
+    return df
+
+def reorder_and_finalize(df: pd.DataFrame,
+                         report_date_col: str,
+                         jurisdiction_col: str,
+                         drop_cols: List[str]) -> pd.DataFrame:
+    df = df.copy()
+    # Normalize leftover objects to string (trim)
+    for col in df.select_dtypes(include=["object"]).columns:
+        df[col] = df[col].astype("string").str.strip()
+    # Drop original month/year
+    for c in drop_cols:
+        if c in df.columns and c not in (report_date_col, jurisdiction_col):
+            df = df.drop(columns=[c])
+    # Order
+    final_cols = [report_date_col, jurisdiction_col] + [c for c in df.columns if c not in (report_date_col, jurisdiction_col)]
+    return df.loc[:, final_cols]
+
+def detect_core_columns(df: pd.DataFrame) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    month_col = find_column(df, [["report","month"], ["month"], ["mnth"]])
+    year_col  = find_column(df, [["report","year"], ["year"], ["yr"]])
+    juris_col = find_column(df, [["jurisdiction"], ["juris"], ["agency"], ["county"]])
+    if juris_col is None:
+        for cand in ["jurisdiction_name","agency_name","agency","county","county_name"]:
+            if cand in df.columns:
+                juris_col = cand
+                break
+    return month_col, year_col, juris_col
+
+# ----------------- Core processing -----------------
+def process_file(input_path: str, output_dir: str = OUTPUT_DIR, sheet: Optional[str] = None) -> str:
+    xls_kwargs = dict(engine=None)
+    df = pd.read_excel(input_path, **xls_kwargs) if sheet is None else pd.read_excel(input_path, sheet_name=sheet, **xls_kwargs)
+    df = standardize_colnames(df)
+
+    month_col, year_col, juris_col = detect_core_columns(df)
+    if month_col is None or year_col is None:
+        raise RuntimeError(f"Could not detect month/year columns in {input_path}.")
+    if juris_col is None:
+        raise RuntimeError(f"Could not detect jurisdiction column in {input_path}.")
+
+    report_date = derive_report_date(df, month_col, year_col)
+    df.insert(0, "report_date", report_date.dt.date)  # ensures YYYY-mm-dd on export
+
+    df.insert(1, "jurisdiction", clean_jurisdiction_name(df[juris_col]))
+    if juris_col in df.columns and juris_col != "jurisdiction":
+        df = df.drop(columns=[juris_col])
+
+    # Typing
+    protected = {"report_date", "jurisdiction"}
+    df = coerce_numeric_columns(df, protected=protected)     # 'U', 'N/A' -> NaN where numeric
+    df = coerce_date_columns(df, protected=protected)        # all '*date*' columns to ISO dates
+
+    # Order and drop original month/year
+    df = reorder_and_finalize(df, "report_date", "jurisdiction", drop_cols=[month_col, year_col])
+
+    os.makedirs(output_dir, exist_ok=True)
+    base = pathlib.Path(input_path).stem
+    out_csv = os.path.join(output_dir, f"{base}__processed.csv")
+    df.to_csv(out_csv, index=False, date_format="%Y-%m-%d")
+    return out_csv
+
+# ----------------- Prompt upload -> process -> download -----------------
+def prompt_upload_process_download():
+    if not _IN_COLAB:
+        print("Run this in Google Colab. Locally, call process_file('/path/to.xlsx').")
+        return
+    print("📤 Please choose your raw BSCC Excel file(s) (.xlsx).")
+    uploaded = files.upload()  # opens picker
+    if not uploaded:
+        print("No files selected.")
+        return
+    outputs = []
+    for fname, data in uploaded.items():
+        with open(fname, "wb") as f:
+            f.write(data)
+        try:
+            out_csv = process_file(fname, OUTPUT_DIR)
+            outputs.append(out_csv)
+            print(f"✅ Processed: {fname} → {out_csv}")
+        except Exception as e:
+            print(f"❌ ERROR processing {fname}: {e}")
+    for out in outputs:
+        print(f"📥 Downloading: {out}")
+        files.download(out)
+
+# --- Auto-run so you get the prompt immediately ---
+prompt_upload_process_download()
